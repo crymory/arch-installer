@@ -48,20 +48,29 @@ if [[ "$SHRINK_NUM" == "0" ]]; then
     
     log "Finding EFI partition..."
     # Try multiple methods to find EFI
-    EFI_PART=$(lsblk -o NAME,PARTLABEL,FSTYPE "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
+    EFI_PART=""
+    
+    # Method 1: By PARTLABEL
+    EFI_PART=$(lsblk -no NAME,PARTLABEL "$DISK" 2>/dev/null | grep -i "efi" | awk '{print $1}' | head -1)
+    [[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
+    
+    # Method 2: By FSTYPE vfat
     if [[ -z "$EFI_PART" ]]; then
-        EFI_PART=$(lsblk -o NAME,FSTYPE "$DISK" | grep vfat | awk '{print "/dev/"$1}' | head -1)
+        EFI_PART=$(lsblk -no NAME,FSTYPE "$DISK" 2>/dev/null | grep "vfat" | awk '{print $1}' | head -1)
+        [[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
     fi
-    if [[ -z "$EFI_PART" ]]; then
-        # Show all partitions and let user choose
+    
+    # Method 3: Manual selection
+    if [[ -z "$EFI_PART" ]] || [[ ! -b "$EFI_PART" ]]; then
         log "Auto-detect failed. Available partitions:"
         lsblk "$DISK" -o NAME,SIZE,FSTYPE,PARTLABEL
         read -rp "Enter EFI partition (e.g. nvme0n1p1): " EFI_INPUT
         EFI_INPUT="${EFI_INPUT#/dev/}"
         EFI_PART="/dev/$EFI_INPUT"
     fi
+    
     [[ -b "$EFI_PART" ]] || err "EFI partition $EFI_PART not found"
-    log "EFI: $EFI_PART"
+    log "Using EFI: $EFI_PART"
     
     mkfs.ext4 "$ROOT_PART"
     mount "$ROOT_PART" /mnt
@@ -228,20 +237,29 @@ log "Created Arch partition: $ROOT_PART"
 
 log "Finding EFI partition..."
 # Try multiple methods to find EFI
-EFI_PART=$(lsblk -o NAME,PARTLABEL,FSTYPE "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
+EFI_PART=""
+
+# Method 1: By PARTLABEL
+EFI_PART=$(lsblk -no NAME,PARTLABEL "$DISK" 2>/dev/null | grep -i "efi" | awk '{print $1}' | head -1)
+[[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
+
+# Method 2: By FSTYPE vfat
 if [[ -z "$EFI_PART" ]]; then
-    EFI_PART=$(lsblk -o NAME,FSTYPE "$DISK" | grep vfat | awk '{print "/dev/"$1}' | head -1)
+    EFI_PART=$(lsblk -no NAME,FSTYPE "$DISK" 2>/dev/null | grep "vfat" | awk '{print $1}' | head -1)
+    [[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
 fi
-if [[ -z "$EFI_PART" ]]; then
-    # Show all partitions and let user choose
+
+# Method 3: Manual selection
+if [[ -z "$EFI_PART" ]] || [[ ! -b "$EFI_PART" ]]; then
     log "Auto-detect failed. Available partitions:"
     lsblk "$DISK" -o NAME,SIZE,FSTYPE,PARTLABEL
     read -rp "Enter EFI partition (e.g. nvme0n1p1): " EFI_INPUT
     EFI_INPUT="${EFI_INPUT#/dev/}"
     EFI_PART="/dev/$EFI_INPUT"
 fi
+
 [[ -b "$EFI_PART" ]] || err "EFI partition $EFI_PART not found"
-log "EFI: $EFI_PART"
+log "Using EFI: $EFI_PART"
 
 mkfs.ext4 "$ROOT_PART"
 mount "$ROOT_PART" /mnt
