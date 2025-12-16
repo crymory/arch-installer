@@ -8,7 +8,7 @@ set -euo pipefail
 ### НАСТРОЙКИ ###
 DISK="/dev/nvme0n1"
 EFI_PART="/dev/nvme0n1p1"
-ROOT_PART="/dev/nvme0n1p5"
+ROOT_PART="/dev/nvme0n1p4"
 
 HOSTNAME="anc"
 USERNAME="anc"
