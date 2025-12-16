@@ -3,69 +3,134 @@ set -e
 
 log() { echo -e "\e[1;32m==>\e[0m $*"; }
 err() { echo -e "\e[1;31m[ERROR]\e[0m $*" >&2; exit 1; }
+warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
 
-# Проверка UEFI
-[[ -d /sys/firmware/efi ]] || err "Требуется UEFI система"
+# Check UEFI
+[[ -d /sys/firmware/efi ]] || err "UEFI system required"
 
-log "Доступные диски:"
+log "Available disks:"
 lsblk -d -o NAME,SIZE,TYPE | grep disk
 echo ""
 
-read -rp "Диск для установки (например sda, nvme0n1): " DISK
+read -rp "Disk with main system (e.g. sda, nvme0n1): " DISK
 DISK="/dev/$DISK"
-[[ -b "$DISK" ]] || err "Диск $DISK не найден"
+[[ -b "$DISK" ]] || err "Disk $DISK not found"
 
-log "Текущая разметка $DISK:"
+log "Current layout $DISK:"
 lsblk "$DISK" -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
-parted "$DISK" print free
 echo ""
 
-read -rp "Размер для root раздела в GB (например 50): " SIZE_GB
-[[ "$SIZE_GB" =~ ^[0-9]+$ ]] || err "Введите число"
+log "Partitions:"
+parted "$DISK" unit GiB print
+echo ""
 
-log "Поиск EFI раздела..."
-EFI_PART=$(lsblk -o NAME,PARTLABEL,TYPE "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
-if [[ -z "$EFI_PART" ]]; then
-    EFI_PART=$(lsblk -o NAME,FSTYPE,TYPE "$DISK" | grep vfat | awk '{print "/dev/"$1}' | head -1)
-fi
-[[ -z "$EFI_PART" ]] && err "EFI раздел не найден"
-log "EFI: $EFI_PART"
+read -rp "Which partition to shrink? (number, e.g. 2): " SHRINK_NUM
+SHRINK_PART="${DISK}${SHRINK_NUM}"
+[[ "$DISK" =~ nvme ]] && SHRINK_PART="${DISK}p${SHRINK_NUM}"
+[[ -b "$SHRINK_PART" ]] || err "Partition $SHRINK_PART not found"
 
-log "Создание раздела ${SIZE_GB}GB в свободном месте..."
-# Получаем следующий номер раздела
-NEXT_PART_NUM=$(parted "$DISK" print | grep -E '^ [0-9]' | tail -1 | awk '{print $1+1}')
-[[ -z "$NEXT_PART_NUM" ]] && NEXT_PART_NUM=2
+# Get filesystem type
+FSTYPE=$(lsblk -no FSTYPE "$SHRINK_PART")
+[[ -z "$FSTYPE" ]] && err "Cannot detect filesystem"
 
-# Создаём раздел в конце диска
-parted "$DISK" --script mkpart primary ext4 -- -${SIZE_GB}GiB -0
-sleep 2
+warn "⚠️  PARTITION: $SHRINK_PART ($FSTYPE)"
+warn "⚠️  BACKUP YOUR DATA BEFORE RESIZING!"
+echo ""
+
+read -rp "How many GB to TAKE from $SHRINK_PART for Arch? (e.g. 50): " SIZE_GB
+[[ "$SIZE_GB" =~ ^[0-9]+$ ]] || err "Enter a number"
+
+read -rp "⚠️ SHRINK $SHRINK_PART by ${SIZE_GB}GB? (yes): " CONFIRM
+[[ "$CONFIRM" != "yes" ]] && err "Cancelled"
+
+log "Checking and resizing partition..."
+
+case "$FSTYPE" in
+    ext4|ext3|ext2)
+        # For ext4: check and resize2fs
+        e2fsck -f "$SHRINK_PART" || warn "Errors fixed"
+        
+        # Get current size in bytes
+        CURRENT_SIZE=$(blockdev --getsize64 "$SHRINK_PART")
+        NEW_SIZE=$((CURRENT_SIZE - SIZE_GB * 1024 * 1024 * 1024))
+        NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
+        
+        resize2fs "$SHRINK_PART" ${NEW_SIZE_MB}M
+        ;;
+    
+    ntfs)
+        # For NTFS (Windows)
+        which ntfsresize >/dev/null || err "Install ntfs-3g: pacman -S ntfs-3g"
+        
+        CURRENT_SIZE=$(blockdev --getsize64 "$SHRINK_PART")
+        NEW_SIZE=$((CURRENT_SIZE - SIZE_GB * 1024 * 1024 * 1024))
+        
+        ntfsresize -n -s $NEW_SIZE "$SHRINK_PART" || err "ntfsresize pre-check failed"
+        ntfsresize -s $NEW_SIZE "$SHRINK_PART"
+        ;;
+    
+    *)
+        err "Unsupported filesystem: $FSTYPE (supported: ext4/ntfs)"
+        ;;
+esac
+
+log "Shrinking partition in partition table..."
+
+# Get partition start
+START=$(parted "$DISK" unit s print | grep "^ ${SHRINK_NUM} " | awk '{print $2}' | sed 's/s//')
+CURRENT_END=$(parted "$DISK" unit s print | grep "^ ${SHRINK_NUM} " | awk '{print $3}' | sed 's/s//')
+
+# New partition end
+SIZE_SECTORS=$((SIZE_GB * 1024 * 1024 * 1024 / 512))
+NEW_END=$((CURRENT_END - SIZE_SECTORS))
+
+# Remove and recreate partition with new size
+parted "$DISK" --script rm ${SHRINK_NUM}
+parted "$DISK" --script mkpart primary ${FSTYPE} ${START}s ${NEW_END}s
+
 partprobe "$DISK"
-sleep 1
+sleep 2
 
-# Определяем имя нового раздела
+log "Creating new partition for Arch..."
+
+# Next partition number
+NEXT_PART_NUM=$(parted "$DISK" print | grep -E '^ [0-9]' | tail -1 | awk '{print $1+1}')
+
+# Create Arch partition right after shrinked one
+ARCH_START=$((NEW_END + 1))
+ARCH_END=$((ARCH_START + SIZE_SECTORS))
+
+parted "$DISK" --script mkpart primary ext4 ${ARCH_START}s ${ARCH_END}s
+
+partprobe "$DISK"
+sleep 2
+
 if [[ "$DISK" =~ nvme ]]; then
     ROOT_PART="${DISK}p${NEXT_PART_NUM}"
 else
     ROOT_PART="${DISK}${NEXT_PART_NUM}"
 fi
 
-[[ -b "$ROOT_PART" ]] || err "Раздел $ROOT_PART не создан"
-log "Создан: $ROOT_PART"
+[[ -b "$ROOT_PART" ]] || err "Partition $ROOT_PART not created"
+log "Created Arch partition: $ROOT_PART"
 
-mount | grep -q "$ROOT_PART" && err "ROOT уже смонтирован"
-
-read -rp "⚠️ ФОРМАТИРОВАТЬ $ROOT_PART ? (yes): " CONFIRM
-[[ "$CONFIRM" != "yes" ]] && err "Отменено"
+log "Finding EFI partition..."
+EFI_PART=$(lsblk -o NAME,PARTLABEL "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
+if [[ -z "$EFI_PART" ]]; then
+    EFI_PART=$(lsblk -o NAME,FSTYPE "$DISK" | grep vfat | awk '{print "/dev/"$1}' | head -1)
+fi
+[[ -z "$EFI_PART" ]] && err "EFI partition not found"
+log "EFI: $EFI_PART"
 
 mkfs.ext4 "$ROOT_PART"
 mount "$ROOT_PART" /mnt
 mkdir -p /mnt/boot/efi
 mount "$EFI_PART" /mnt/boot/efi
 
-log "Интернет проверка"
-ping -c 2 archlinux.org >/dev/null || err "Нет интернета"
+log "Internet check"
+ping -c 2 archlinux.org >/dev/null || err "No internet connection"
 
-log "Установка базы"
+log "Installing base system"
 pacstrap /mnt base linux linux-firmware sudo networkmanager vim git
 
 genfstab -U /mnt >> /mnt/etc/fstab
@@ -113,18 +178,14 @@ chown -R anc:anc /home/anc
 EOF
 
 log "GPU auto-detect..."
-GPU_PKGS="mesa"
 if lspci | grep -Ei "nvidia"; then
-    GPU_PKGS="nvidia nvidia-utils nvidia-settings"
-    arch-chroot /mnt pacman -S --noconfirm $GPU_PKGS
+    arch-chroot /mnt pacman -S --noconfirm nvidia nvidia-utils nvidia-settings
 elif lspci | grep -Ei "amd|radeon"; then
-    GPU_PKGS="vulkan-radeon libva-mesa-driver mesa-vdpau"
-    arch-chroot /mnt pacman -S --noconfirm $GPU_PKGS
+    arch-chroot /mnt pacman -S --noconfirm vulkan-radeon libva-mesa-driver mesa-vdpau
 elif lspci | grep -Ei "intel"; then
-    GPU_PKGS="vulkan-intel intel-media-driver"
-    arch-chroot /mnt pacman -S --noconfirm $GPU_PKGS
+    arch-chroot /mnt pacman -S --noconfirm vulkan-intel intel-media-driver
 fi
 
-log "✅ Готово! Размонтирование..."
+log "✅ Done! Unmounting..."
 umount -R /mnt
-log "Можно делать reboot"
+log "You can reboot now"
