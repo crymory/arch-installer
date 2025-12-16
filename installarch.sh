@@ -13,6 +13,8 @@ lsblk -d -o NAME,SIZE,TYPE | grep disk
 echo ""
 
 read -rp "Disk with main system (e.g. sda, nvme0n1): " DISK
+# Remove /dev/ if user added it
+DISK="${DISK#/dev/}"
 DISK="/dev/$DISK"
 [[ -b "$DISK" ]] || err "Disk $DISK not found"
 
@@ -24,7 +26,117 @@ log "Partitions:"
 parted "$DISK" unit GiB print
 echo ""
 
-read -rp "Which partition to shrink? (number, e.g. 2): " SHRINK_NUM
+read -rp "Which partition to shrink? (number, e.g. 2, or 0 to use existing): " SHRINK_NUM
+
+# Check if user wants to reuse existing partition
+if [[ "$SHRINK_NUM" == "0" ]]; then
+    log "Looking for existing ext4 partitions..."
+    lsblk "$DISK" -o NAME,SIZE,FSTYPE | grep ext4
+    echo ""
+    read -rp "Enter partition number to reuse (e.g. 3): " REUSE_NUM
+    
+    if [[ "$DISK" =~ nvme ]]; then
+        ROOT_PART="${DISK}p${REUSE_NUM}"
+    else
+        ROOT_PART="${DISK}${REUSE_NUM}"
+    fi
+    
+    [[ -b "$ROOT_PART" ]] || err "Partition $ROOT_PART not found"
+    
+    read -rp "⚠️ FORMAT $ROOT_PART and install Arch? (yes): " CONFIRM
+    [[ "$CONFIRM" != "yes" ]] && err "Cancelled"
+    
+    log "Finding EFI partition..."
+    # Try multiple methods to find EFI
+    EFI_PART=$(lsblk -o NAME,PARTLABEL,FSTYPE "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
+    if [[ -z "$EFI_PART" ]]; then
+        EFI_PART=$(lsblk -o NAME,FSTYPE "$DISK" | grep vfat | awk '{print "/dev/"$1}' | head -1)
+    fi
+    if [[ -z "$EFI_PART" ]]; then
+        # Show all partitions and let user choose
+        log "Auto-detect failed. Available partitions:"
+        lsblk "$DISK" -o NAME,SIZE,FSTYPE,PARTLABEL
+        read -rp "Enter EFI partition (e.g. nvme0n1p1): " EFI_INPUT
+        EFI_INPUT="${EFI_INPUT#/dev/}"
+        EFI_PART="/dev/$EFI_INPUT"
+    fi
+    [[ -b "$EFI_PART" ]] || err "EFI partition $EFI_PART not found"
+    log "EFI: $EFI_PART"
+    
+    mkfs.ext4 "$ROOT_PART"
+    mount "$ROOT_PART" /mnt
+    mkdir -p /mnt/boot/efi
+    mount "$EFI_PART" /mnt/boot/efi
+    
+    # Skip to installation
+    SKIP_PARTITION=true
+fi
+
+[[ "$SKIP_PARTITION" == "true" ]] && {
+    log "Internet check"
+    ping -c 2 archlinux.org >/dev/null || err "No internet connection"
+    log "Installing base system"
+    pacstrap /mnt base linux linux-firmware sudo networkmanager vim git
+    genfstab -U /mnt >> /mnt/etc/fstab
+    
+    arch-chroot /mnt /bin/bash <<EOF
+set -e
+ln -sf /usr/share/zoneinfo/Europe/Kyiv /etc/localtime
+hwclock --systohc
+sed -i 's/#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
+locale-gen
+echo 'LANG=en_US.UTF-8' > /etc/locale.conf
+echo arch-hypr > /etc/hostname
+
+useradd -m -G wheel anc
+echo "anc:anc" | chpasswd
+echo "root:anc" | chpasswd
+sed -i 's/# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
+
+systemctl enable NetworkManager
+
+pacman -S --noconfirm grub efibootmgr
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Arch-Hypr
+grub-mkconfig -o /boot/grub/grub.cfg
+
+pacman -S --noconfirm \\
+  hyprland xorg-xwayland mesa libinput seatd \\
+  waybar rofi kitty \\
+  pipewire pipewire-pulse wireplumber \\
+  wl-clipboard grim slurp \\
+  sddm
+
+systemctl enable sddm seatd
+
+mkdir -p /home/anc/.config/hypr
+cat > /home/anc/.config/hypr/hyprland.conf <<HYPR
+monitor=,preferred,auto,1
+\\\$mainMod=SUPER
+bind=\\\$mainMod,RETURN,exec,kitty
+bind=\\\$mainMod,D,exec,rofi -show drun
+bind=\\\$mainMod,Q,killactive
+exec-once=waybar
+HYPR
+
+chown -R anc:anc /home/anc
+EOF
+
+    log "GPU auto-detect..."
+    if lspci | grep -Ei "nvidia"; then
+        arch-chroot /mnt pacman -S --noconfirm nvidia nvidia-utils nvidia-settings
+    elif lspci | grep -Ei "amd|radeon"; then
+        arch-chroot /mnt pacman -S --noconfirm vulkan-radeon libva-mesa-driver mesa-vdpau
+    elif lspci | grep -Ei "intel"; then
+        arch-chroot /mnt pacman -S --noconfirm vulkan-intel intel-media-driver
+    fi
+
+    log "✅ Done! Unmounting..."
+    umount -R /mnt
+    log "You can reboot now"
+    exit 0
+}
+
+# Continue with shrinking if not skipped
 SHRINK_PART="${DISK}${SHRINK_NUM}"
 [[ "$DISK" =~ nvme ]] && SHRINK_PART="${DISK}p${SHRINK_NUM}"
 [[ -b "$SHRINK_PART" ]] || err "Partition $SHRINK_PART not found"
@@ -115,11 +227,20 @@ fi
 log "Created Arch partition: $ROOT_PART"
 
 log "Finding EFI partition..."
-EFI_PART=$(lsblk -o NAME,PARTLABEL "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
+# Try multiple methods to find EFI
+EFI_PART=$(lsblk -o NAME,PARTLABEL,FSTYPE "$DISK" | grep -i efi | awk '{print "/dev/"$1}' | head -1)
 if [[ -z "$EFI_PART" ]]; then
     EFI_PART=$(lsblk -o NAME,FSTYPE "$DISK" | grep vfat | awk '{print "/dev/"$1}' | head -1)
 fi
-[[ -z "$EFI_PART" ]] && err "EFI partition not found"
+if [[ -z "$EFI_PART" ]]; then
+    # Show all partitions and let user choose
+    log "Auto-detect failed. Available partitions:"
+    lsblk "$DISK" -o NAME,SIZE,FSTYPE,PARTLABEL
+    read -rp "Enter EFI partition (e.g. nvme0n1p1): " EFI_INPUT
+    EFI_INPUT="${EFI_INPUT#/dev/}"
+    EFI_PART="/dev/$EFI_INPUT"
+fi
+[[ -b "$EFI_PART" ]] || err "EFI partition $EFI_PART not found"
 log "EFI: $EFI_PART"
 
 mkfs.ext4 "$ROOT_PART"
