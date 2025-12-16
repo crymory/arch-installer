@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+
+
 mount | grep -q "$ROOT_PART" && err "ROOT уже смонтирован"
 
 
@@ -79,6 +81,22 @@ HYPR
 
 chown -R anc:anc /home/anc
 EOF
+
+
+# --- GPU auto-detect ---
+GPU_PKGS="mesa"
+
+
+if lspci | grep -Ei "nvidia"; then
+GPU_PKGS="mesa nvidia nvidia-utils nvidia-settings"
+elif lspci | grep -Ei "amd|radeon"; then
+GPU_PKGS="mesa vulkan-radeon libva-mesa-driver mesa-vdpau"
+elif lspci | grep -Ei "intel"; then
+GPU_PKGS="mesa vulkan-intel intel-media-driver"
+fi
+
+
+pacman -S --noconfirm $GPU_PKGS
 
 
 log "✅ Готово! reboot"
