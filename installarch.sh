@@ -1,93 +1,61 @@
 #!/usr/bin/env bash
 set -e
 
+# --- Функции логирования ---
 log() { echo -e "\e[1;32m==>\e[0m $*"; }
 err() { echo -e "\e[1;31m[ERROR]\e[0m $*" >&2; exit 1; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
 
-# Check UEFI
+# --- Проверка UEFI ---
 [[ -d /sys/firmware/efi ]] || err "UEFI system required"
 
+# --- Исправление проблем с интернетом и репозиториями ---
+log "Checking internet connection..."
+ping -c 2 8.8.8.8 >/dev/null || err "No internet connection. Please connect via iwctl."
+
+log "Syncing system clock (needed for SSL)..."
+timedatectl set-ntp true
+
+log "Updating Arch Linux Keyring..."
+# Это решает проблему 'invalid or corrupted package' при установке
+pacman -Sy --noconfirm archlinux-keyring
+
+# --- Выбор диска ---
 log "Available disks:"
 lsblk -d -o NAME,SIZE,TYPE | grep disk
 echo ""
 
 read -rp "Disk with main system (e.g. sda, nvme0n1): " DISK
-# Remove /dev/ if user added it
 DISK="${DISK#/dev/}"
 DISK="/dev/$DISK"
 [[ -b "$DISK" ]] || err "Disk $DISK not found"
 
+# --- Выбор режима: Shrink или Reuse ---
 log "Current layout $DISK:"
 lsblk "$DISK" -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
 echo ""
 
-log "Partitions:"
-parted "$DISK" unit GiB print
-echo ""
-
 read -rp "Which partition to shrink? (number, e.g. 2, or 0 to use existing): " SHRINK_NUM
 
-# Check if user wants to reuse existing partition
-if [[ "$SHRINK_NUM" == "0" ]]; then
-    log "Looking for existing ext4 partitions..."
-    lsblk "$DISK" -o NAME,SIZE,FSTYPE | grep ext4
-    echo ""
-    read -rp "Enter partition number to reuse (e.g. 3): " REUSE_NUM
-    
-    if [[ "$DISK" =~ nvme ]]; then
-        ROOT_PART="${DISK}p${REUSE_NUM}"
-    else
-        ROOT_PART="${DISK}${REUSE_NUM}"
-    fi
-    
-    [[ -b "$ROOT_PART" ]] || err "Partition $ROOT_PART not found"
-    
-    read -rp "⚠️ FORMAT $ROOT_PART and install Arch? (yes): " CONFIRM
-    [[ "$CONFIRM" != "yes" ]] && err "Cancelled"
-    
-    log "Finding EFI partition..."
-    # Try multiple methods to find EFI
-    EFI_PART=""
-    
-    # Method 1: By PARTLABEL
-    EFI_PART=$(lsblk -no NAME,PARTLABEL "$DISK" 2>/dev/null | grep -i "efi" | awk '{print $1}' | head -1)
-    [[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
-    
-    # Method 2: By FSTYPE vfat
-    if [[ -z "$EFI_PART" ]]; then
-        EFI_PART=$(lsblk -no NAME,FSTYPE "$DISK" 2>/dev/null | grep "vfat" | awk '{print $1}' | head -1)
-        [[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
-    fi
-    
-    # Method 3: Manual selection
-    if [[ -z "$EFI_PART" ]] || [[ ! -b "$EFI_PART" ]]; then
-        log "Auto-detect failed. Available partitions:"
-        lsblk "$DISK" -o NAME,SIZE,FSTYPE,PARTLABEL
-        read -rp "Enter EFI partition (e.g. nvme0n1p1): " EFI_INPUT
-        EFI_INPUT="${EFI_INPUT#/dev/}"
-        EFI_PART="/dev/$EFI_INPUT"
-    fi
-    
-    [[ -b "$EFI_PART" ]] || err "EFI partition $EFI_PART not found"
-    log "Using EFI: $EFI_PART"
-    
-    mkfs.ext4 "$ROOT_PART"
-    mount "$ROOT_PART" /mnt
-    mkdir -p /mnt/boot/efi
-    mount "$EFI_PART" /mnt/boot/efi
-    
-    # Skip to installation
-    SKIP_PARTITION=true
-fi
+# --- Функция самой установки (чтобы не дублировать код) ---
+run_install() {
+    local root_part=$1
+    local efi_part=$2
 
-[[ "$SKIP_PARTITION" == "true" ]] && {
-    log "Internet check"
-    ping -c 2 archlinux.org >/dev/null || err "No internet connection"
-    log "Installing base system"
-    pacstrap /mnt base linux linux-firmware sudo networkmanager vim git
+    log "Formatting and mounting $root_part..."
+    mkfs.ext4 -F "$root_part"
+    mount "$root_part" /mnt
+    mkdir -p /mnt/boot/efi
+    mount "$efi_part" /mnt/boot/efi
+
+    log "Installing base system (pacstrap)..."
+    # Добавляем необходимые пакеты сразу
+    pacstrap /mnt base linux linux-firmware sudo networkmanager vim git --noconfirm
+
+    log "Generating fstab..."
     genfstab -U /mnt >> /mnt/etc/fstab
-    
+
+    log "Configuring system inside chroot..."
     arch-chroot /mnt /bin/bash <<EOF
 set -e
 ln -sf /usr/share/zoneinfo/Europe/Kyiv /etc/localtime
@@ -97,6 +65,7 @@ locale-gen
 echo 'LANG=en_US.UTF-8' > /etc/locale.conf
 echo arch-hypr > /etc/hostname
 
+# Пользователь
 useradd -m -G wheel anc
 echo "anc:anc" | chpasswd
 echo "root:anc" | chpasswd
@@ -104,26 +73,23 @@ sed -i 's/# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
 systemctl enable NetworkManager
 
+# Загрузчик
 pacman -S --noconfirm grub efibootmgr
 grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Arch-Hypr
 grub-mkconfig -o /boot/grub/grub.cfg
 
-pacman -S --noconfirm \\
-  hyprland xorg-xwayland mesa libinput seatd \\
-  waybar rofi kitty \\
-  pipewire pipewire-pulse wireplumber \\
-  wl-clipboard grim slurp \\
-  sddm
-
+# Hyprland и окружение
+pacman -S --noconfirm hyprland xorg-xwayland mesa libinput seatd waybar rofi kitty pipewire pipewire-pulse wireplumber wl-clipboard grim slurp sddm
 systemctl enable sddm seatd
 
+# Дефолтный конфиг Hyprland (экранируем спецсимволы)
 mkdir -p /home/anc/.config/hypr
 cat > /home/anc/.config/hypr/hyprland.conf <<HYPR
 monitor=,preferred,auto,1
-\\\$mainMod=SUPER
-bind=\\\$mainMod,RETURN,exec,kitty
-bind=\\\$mainMod,D,exec,rofi -show drun
-bind=\\\$mainMod,Q,killactive
+\$mainMod=SUPER
+bind=\$mainMod,RETURN,exec,kitty
+bind=\$mainMod,D,exec,rofi -show drun
+bind=\$mainMod,Q,killactive
 exec-once=waybar
 HYPR
 
@@ -131,200 +97,90 @@ chown -R anc:anc /home/anc
 EOF
 
     log "GPU auto-detect..."
-    if lspci | grep -Ei "nvidia"; then
+    if lspci | grep -Ei "nvidia" >/dev/null; then
         arch-chroot /mnt pacman -S --noconfirm nvidia nvidia-utils nvidia-settings
-    elif lspci | grep -Ei "amd|radeon"; then
+    elif lspci | grep -Ei "amd|radeon" >/dev/null; then
         arch-chroot /mnt pacman -S --noconfirm vulkan-radeon libva-mesa-driver mesa-vdpau
-    elif lspci | grep -Ei "intel"; then
+    elif lspci | grep -Ei "intel" >/dev/null; then
         arch-chroot /mnt pacman -S --noconfirm vulkan-intel intel-media-driver
     fi
 
     log "✅ Done! Unmounting..."
     umount -R /mnt
     log "You can reboot now"
-    exit 0
 }
 
-# Continue with shrinking if not skipped
-SHRINK_PART="${DISK}${SHRINK_NUM}"
-[[ "$DISK" =~ nvme ]] && SHRINK_PART="${DISK}p${SHRINK_NUM}"
+# --- Логика поиска EFI ---
+find_efi() {
+    local found_efi=""
+    found_efi=$(lsblk -no NAME,PARTLABEL "$DISK" 2>/dev/null | grep -i "efi" | awk '{print $1}' | head -1)
+    if [[ -z "$found_efi" ]]; then
+        found_efi=$(lsblk -no NAME,FSTYPE "$DISK" 2>/dev/null | grep "vfat" | awk '{print $1}' | head -1)
+    fi
+    if [[ -z "$found_efi" ]]; then
+        log "EFI not found. Available:"
+        lsblk "$DISK" -o NAME,SIZE,FSTYPE
+        read -rp "Enter EFI partition name (e.g. nvme0n1p1): " EFI_INPUT
+        found_efi="${EFI_INPUT#/dev/}"
+    fi
+    echo "/dev/$found_efi"
+}
+
+# --- Сценарий 1: Использование существующего раздела ---
+if [[ "$SHRINK_NUM" == "0" ]]; then
+    log "Looking for existing ext4 partitions..."
+    lsblk "$DISK" -o NAME,SIZE,FSTYPE | grep ext4
+    read -rp "Enter partition number to reuse (e.g. 3): " REUSE_NUM
+    
+    [[ "$DISK" =~ nvme ]] && ROOT_P="${DISK}p${REUSE_NUM}" || ROOT_P="${DISK}${REUSE_NUM}"
+    EFI_P=$(find_efi)
+    
+    read -rp "⚠️ FORMAT $ROOT_P and install? (yes): " CONFIRM
+    [[ "$CONFIRM" != "yes" ]] && err "Cancelled"
+    
+    run_install "$ROOT_P" "$EFI_P"
+    exit 0
+fi
+
+# --- Сценарий 2: Сжатие раздела и установка ---
+[[ "$DISK" =~ nvme ]] && SHRINK_PART="${DISK}p${SHRINK_NUM}" || SHRINK_PART="${DISK}${SHRINK_NUM}"
 [[ -b "$SHRINK_PART" ]] || err "Partition $SHRINK_PART not found"
 
-# Get filesystem type
 FSTYPE=$(lsblk -no FSTYPE "$SHRINK_PART")
-[[ -z "$FSTYPE" ]] && err "Cannot detect filesystem"
-
 warn "⚠️  PARTITION: $SHRINK_PART ($FSTYPE)"
-warn "⚠️  BACKUP YOUR DATA BEFORE RESIZING!"
-echo ""
+read -rp "How many GB to TAKE from this partition for Arch? (e.g. 50): " SIZE_GB
 
-read -rp "How many GB to TAKE from $SHRINK_PART for Arch? (e.g. 50): " SIZE_GB
-[[ "$SIZE_GB" =~ ^[0-9]+$ ]] || err "Enter a number"
-
-read -rp "⚠️ SHRINK $SHRINK_PART by ${SIZE_GB}GB? (yes): " CONFIRM
-[[ "$CONFIRM" != "yes" ]] && err "Cancelled"
-
-log "Checking and resizing partition..."
-
-case "$FSTYPE" in
-    ext4|ext3|ext2)
-        # For ext4: check and resize2fs
-        e2fsck -f "$SHRINK_PART" || warn "Errors fixed"
-        
-        # Get current size in bytes
-        CURRENT_SIZE=$(blockdev --getsize64 "$SHRINK_PART")
-        NEW_SIZE=$((CURRENT_SIZE - SIZE_GB * 1024 * 1024 * 1024))
-        NEW_SIZE_MB=$((NEW_SIZE / 1024 / 1024))
-        
-        resize2fs "$SHRINK_PART" ${NEW_SIZE_MB}M
-        ;;
-    
-    ntfs)
-        # For NTFS (Windows)
-        which ntfsresize >/dev/null || err "Install ntfs-3g: pacman -S ntfs-3g"
-        
-        CURRENT_SIZE=$(blockdev --getsize64 "$SHRINK_PART")
-        NEW_SIZE=$((CURRENT_SIZE - SIZE_GB * 1024 * 1024 * 1024))
-        
-        ntfsresize -n -s $NEW_SIZE "$SHRINK_PART" || err "ntfsresize pre-check failed"
-        ntfsresize -s $NEW_SIZE "$SHRINK_PART"
-        ;;
-    
-    *)
-        err "Unsupported filesystem: $FSTYPE (supported: ext4/ntfs)"
-        ;;
-esac
-
-log "Shrinking partition in partition table..."
-
-# Get partition start
-START=$(parted "$DISK" unit s print | grep "^ ${SHRINK_NUM} " | awk '{print $2}' | sed 's/s//')
-CURRENT_END=$(parted "$DISK" unit s print | grep "^ ${SHRINK_NUM} " | awk '{print $3}' | sed 's/s//')
-
-# New partition end
-SIZE_SECTORS=$((SIZE_GB * 1024 * 1024 * 1024 / 512))
-NEW_END=$((CURRENT_END - SIZE_SECTORS))
-
-# Remove and recreate partition with new size
-parted "$DISK" --script rm ${SHRINK_NUM}
-parted "$DISK" --script mkpart primary ${FSTYPE} ${START}s ${NEW_END}s
-
-partprobe "$DISK"
-sleep 2
-
-log "Creating new partition for Arch..."
-
-# Next partition number
-NEXT_PART_NUM=$(parted "$DISK" print | grep -E '^ [0-9]' | tail -1 | awk '{print $1+1}')
-
-# Create Arch partition right after shrinked one
-ARCH_START=$((NEW_END + 1))
-ARCH_END=$((ARCH_START + SIZE_SECTORS))
-
-parted "$DISK" --script mkpart primary ext4 ${ARCH_START}s ${ARCH_END}s
-
-partprobe "$DISK"
-sleep 2
-
-if [[ "$DISK" =~ nvme ]]; then
-    ROOT_PART="${DISK}p${NEXT_PART_NUM}"
+log "Resizing $FSTYPE filesystem..."
+if [[ "$FSTYPE" == "ext4" ]]; then
+    e2fsck -f "$SHRINK_PART" || true
+    CUR_SIZE=$(blockdev --getsize64 "$SHRINK_PART")
+    NEW_SIZE_MB=$(( (CUR_SIZE - SIZE_GB * 1024*1024*1024) / 1024/1024 ))
+    resize2fs "$SHRINK_PART" ${NEW_SIZE_MB}M
+elif [[ "$FSTYPE" == "ntfs" ]]; then
+    which ntfsresize >/dev/null || pacman -Sy --noconfirm ntfs-3g
+    CUR_SIZE=$(blockdev --getsize64 "$SHRINK_PART")
+    NEW_SIZE=$((CUR_SIZE - SIZE_GB * 1024*1024*1024))
+    ntfsresize -s $NEW_SIZE "$SHRINK_PART"
 else
-    ROOT_PART="${DISK}${NEXT_PART_NUM}"
+    err "Unsupported filesystem for shrinking: $FSTYPE"
 fi
 
-[[ -b "$ROOT_PART" ]] || err "Partition $ROOT_PART not created"
-log "Created Arch partition: $ROOT_PART"
+log "Modifying partition table..."
+START=$(parted "$DISK" unit s print | grep "^ ${SHRINK_NUM} " | awk '{print $2}' | sed 's/s//')
+OLD_END=$(parted "$DISK" unit s print | grep "^ ${SHRINK_NUM} " | awk '{print $3}' | sed 's/s//')
+SIZE_SECTORS=$((SIZE_GB * 1024 * 1024 * 1024 / 512))
+NEW_END=$((OLD_END - SIZE_SECTORS))
 
-log "Finding EFI partition..."
-# Try multiple methods to find EFI
-EFI_PART=""
+parted "$DISK" --script rm "${SHRINK_NUM}"
+parted "$DISK" --script mkpart primary "${FSTYPE}" "${START}s" "${NEW_END}s"
+parted "$DISK" --script mkpart primary ext4 "$((NEW_END + 1))s" "${OLD_END}s"
 
-# Method 1: By PARTLABEL
-EFI_PART=$(lsblk -no NAME,PARTLABEL "$DISK" 2>/dev/null | grep -i "efi" | awk '{print $1}' | head -1)
-[[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
+partprobe "$DISK"
+sleep 2
 
-# Method 2: By FSTYPE vfat
-if [[ -z "$EFI_PART" ]]; then
-    EFI_PART=$(lsblk -no NAME,FSTYPE "$DISK" 2>/dev/null | grep "vfat" | awk '{print $1}' | head -1)
-    [[ -n "$EFI_PART" ]] && EFI_PART="/dev/$EFI_PART"
-fi
+# Находим номер нового (последнего) раздела
+NEW_PART_NUM=$(parted "$DISK" print | grep -E '^ [0-9]' | tail -1 | awk '{print $1}')
+[[ "$DISK" =~ nvme ]] && ROOT_P="${DISK}p${NEW_PART_NUM}" || ROOT_P="${DISK}${NEW_PART_NUM}"
+EFI_P=$(find_efi)
 
-# Method 3: Manual selection
-if [[ -z "$EFI_PART" ]] || [[ ! -b "$EFI_PART" ]]; then
-    log "Auto-detect failed. Available partitions:"
-    lsblk "$DISK" -o NAME,SIZE,FSTYPE,PARTLABEL
-    read -rp "Enter EFI partition (e.g. nvme0n1p1): " EFI_INPUT
-    EFI_INPUT="${EFI_INPUT#/dev/}"
-    EFI_PART="/dev/$EFI_INPUT"
-fi
-
-[[ -b "$EFI_PART" ]] || err "EFI partition $EFI_PART not found"
-log "Using EFI: $EFI_PART"
-
-mkfs.ext4 "$ROOT_PART"
-mount "$ROOT_PART" /mnt
-mkdir -p /mnt/boot/efi
-mount "$EFI_PART" /mnt/boot/efi
-
-log "Internet check"
-ping -c 2 archlinux.org >/dev/null || err "No internet connection"
-
-log "Installing base system"
-pacstrap /mnt base linux linux-firmware sudo networkmanager vim git
-
-genfstab -U /mnt >> /mnt/etc/fstab
-
-arch-chroot /mnt /bin/bash <<EOF
-set -e
-ln -sf /usr/share/zoneinfo/Europe/Kyiv /etc/localtime
-hwclock --systohc
-sed -i 's/#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
-locale-gen
-echo 'LANG=en_US.UTF-8' > /etc/locale.conf
-echo arch-hypr > /etc/hostname
-
-useradd -m -G wheel anc
-echo "anc:anc" | chpasswd
-echo "root:anc" | chpasswd
-sed -i 's/# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
-
-systemctl enable NetworkManager
-
-pacman -S --noconfirm grub efibootmgr
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Arch-Hypr
-grub-mkconfig -o /boot/grub/grub.cfg
-
-pacman -S --noconfirm \\
-  hyprland xorg-xwayland mesa libinput seatd \\
-  waybar rofi kitty \\
-  pipewire pipewire-pulse wireplumber \\
-  wl-clipboard grim slurp \\
-  sddm
-
-systemctl enable sddm seatd
-
-mkdir -p /home/anc/.config/hypr
-cat > /home/anc/.config/hypr/hyprland.conf <<HYPR
-monitor=,preferred,auto,1
-\\\$mainMod=SUPER
-bind=\\\$mainMod,RETURN,exec,kitty
-bind=\\\$mainMod,D,exec,rofi -show drun
-bind=\\\$mainMod,Q,killactive
-exec-once=waybar
-HYPR
-
-chown -R anc:anc /home/anc
-EOF
-
-log "GPU auto-detect..."
-if lspci | grep -Ei "nvidia"; then
-    arch-chroot /mnt pacman -S --noconfirm nvidia nvidia-utils nvidia-settings
-elif lspci | grep -Ei "amd|radeon"; then
-    arch-chroot /mnt pacman -S --noconfirm vulkan-radeon libva-mesa-driver mesa-vdpau
-elif lspci | grep -Ei "intel"; then
-    arch-chroot /mnt pacman -S --noconfirm vulkan-intel intel-media-driver
-fi
-
-log "✅ Done! Unmounting..."
-umount -R /mnt
-log "You can reboot now"
+run_install "$ROOT_P" "$EFI_P"
